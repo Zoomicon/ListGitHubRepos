@@ -10,8 +10,6 @@
       -SkipDotPrefix             Skip repositories whose names start with a dot.
       -SaveDebugFiles            Save raw JSON responses into a repo-debug folder for inspection.
       -MaxAttempts <int>         Number of attempts for API calls (default 4).
-.EXAMPLE
-  .\ListGitHubRepos.ps1 -Accounts "octocat, microsoft" -HideForks -SaveDebugFiles -MaxAttempts 6
 #>
 
 param(
@@ -37,7 +35,7 @@ elseif ($MaxAttempts -gt 20) { $MaxAttempts = 20 }
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Diagnostic wrappers: print message then a single blank line
+# Diagnostic wrappers
 function Write-Diagnostic {
     param([Parameter(Mandatory=$true)][string]$Message)
     Write-Host $Message
@@ -71,198 +69,209 @@ if ($SaveDebugFiles) {
     }
 }
 
-function Invoke-GitHubApi {
-    param([Parameter(Mandatory=$true)][string]$Url)
+# Helper: save response body and headers for debugging
+function Save-DebugResponse {
+    param(
+        [Parameter(Mandatory=$true)][string]$Prefix,
+        [Parameter(Mandatory=$true)][string]$Body,
+        [hashtable]$Hdrs = $null,
+        [int]$StatusCode = $null
+    )
+    if (-not $SaveDebugFiles) { return }
+    try {
+        $safePrefix = ($Prefix -replace '[\\/:*?""<>| ]','_')
+        $time = (Get-Date).ToString('yyyyMMdd_HHmmss')
+        $fileBase = Join-Path $debugDir ("{0}_{1}" -f $safePrefix, $time)
+        $hdrFile = $fileBase + ".headers.txt"
+        $bodyFile = $fileBase + ".body.txt"
+        if ($Hdrs) {
+            $out = @()
+            if ($StatusCode) { $out += "StatusCode: $StatusCode" }
+            foreach ($k in $Hdrs.Keys) { $out += ("{0}: {1}" -f $k, $Hdrs[$k]) }
+            $out | Out-File -FilePath $hdrFile -Encoding UTF8
+        }
+        $Body | Out-File -FilePath $bodyFile -Encoding UTF8
+        Write-Diagnostic ("Saved debug files: " + (Split-Path $hdrFile -Leaf) + ", " + (Split-Path $bodyFile -Leaf))
+    } catch {
+        Write-DiagnosticWarning "Failed to save debug response."
+    }
+}
 
-    # Use the script-level MaxAttempts (fallback to 4 if somehow unset)
+# Helper: convert header collection to hashtable safely
+function Headers-ToHashtable {
+    param([object]$Headers)
+    $ht = @{}
+    if ($null -eq $Headers) { return $ht }
+    try {
+        foreach ($name in $Headers.Keys) {
+            $ht[$name] = $Headers[$name]
+        }
+    } catch {
+        # best-effort fallback
+        try {
+            $Headers | Get-Member -MemberType NoteProperty | ForEach-Object {
+                $n = $_.Name
+                $ht[$n] = $Headers.$n
+            }
+        } catch {}
+    }
+    return $ht
+}
+
+# Helper: check global rate limit and optionally wait until reset
+function Check-GlobalRateLimit {
+    try {
+        $rlResp = Invoke-WebRequest -Uri 'https://api.github.com/rate_limit' -Headers $headers -Method Get -ErrorAction SilentlyContinue
+        if ($null -eq $rlResp) {
+            Write-DiagnosticWarning "Could not fetch global rate limit (no response)."
+            return $null
+        }
+
+        $hdrs = Headers-ToHashtable $rlResp.Headers
+        $coreRem = $hdrs['X-RateLimit-Remaining']
+        $coreLimit = $hdrs['X-RateLimit-Limit']
+        $coreReset = $hdrs['X-RateLimit-Reset']
+        $retryAfter = $hdrs['Retry-After']
+
+        $parts = @()
+        if ($coreRem -and $coreLimit) { $parts += "remaining=$coreRem/$coreLimit" }
+        elseif ($coreLimit) { $parts += "limit=$coreLimit" }
+        if ($coreReset) {
+            $nowEpoch = [int](Get-Date -UFormat %s)
+            $wait = [int]$coreReset - $nowEpoch
+            if ($wait -lt 0) { $wait = 0 }
+            $parts += "reset_epoch=$coreReset; in ${wait}s"
+        }
+        if ($retryAfter) { $parts += "retry_after=${retryAfter}s" }
+        if ($parts.Count -gt 0) { Write-Diagnostic ("Global rate: " + ($parts -join " ; ")) }
+
+        # If remaining is zero, wait until reset (small safety margin)
+        if ($coreRem -and ($coreRem -eq '0') -and $coreReset) {
+            $nowEpoch = [int](Get-Date -UFormat %s)
+            $wait = [int]$coreReset - $nowEpoch
+            if ($wait -gt 0) {
+                Write-Diagnostic ("Global rate limit exhausted; waiting $wait seconds until reset (epoch $coreReset).")
+                Start-Sleep -Seconds ($wait + 2)
+            }
+        }
+
+        # Try to parse JSON body for additional info (not required)
+        return @{
+            Remaining = $coreRem
+            Limit = $coreLimit
+            Reset = $coreReset
+            RetryAfter = $retryAfter
+            Headers = $hdrs
+        }
+    } catch {
+        Write-DiagnosticWarning "Could not fetch global rate limit."
+        return $null
+    }
+}
+
+# Unified API caller: prefer Invoke-RestMethod for JSON, but capture headers and bodies on error
+function Invoke-GitHubJson {
+    param(
+        [Parameter(Mandatory=$true)][string]$Url,
+        [string]$DebugPrefix = "request"
+    )
+
     $maxAttempts = if ($MaxAttempts -and ($MaxAttempts -is [int])) { $MaxAttempts } else { 4 }
     $attempt = 0
     $baseDelaySeconds = 1
+    $lastSeenRemaining = $null
 
     while ($true) {
         $attempt++
-        # First try a non-throwing request so we always get headers when the server responds
         try {
-            $webResp = Invoke-WebRequest -Uri $Url -Headers $headers -Method Get -ErrorAction SilentlyContinue
+            # Use Invoke-RestMethod for JSON parsing
+            $resp = Invoke-RestMethod -Uri $Url -Headers $headers -Method Get -ErrorAction Stop
+            # If successful, we don't have headers from RestMethod; fetch headers with a lightweight webrequest
+            try {
+                $hdrResp = Invoke-WebRequest -Uri $Url -Headers $headers -Method Get -ErrorAction SilentlyContinue
+                if ($hdrResp -ne $null) {
+                    $hdrs = Headers-ToHashtable $hdrResp.Headers
+                    if ($hdrs['X-RateLimit-Remaining']) { $lastSeenRemaining = $hdrs['X-RateLimit-Remaining'] }
+                }
+            } catch {}
+            return @{ Result = $resp; Remaining = $lastSeenRemaining }
         } catch {
-            # Network-level failure (DNS, TLS, etc.) — fall through to exception handling below
-            $webResp = $null
-        }
-
-        # If we got a response object, inspect status and headers
-        if ($null -ne $webResp) {
-            # Normalize status code to int if possible
-            $statusCode = $null
-            try { $statusCode = [int]$webResp.StatusCode } catch { $statusCode = $null }
-
-            # Always log rate headers when present
-            if ($webResp.Headers) {
-                $limit = $webResp.Headers.'X-RateLimit-Limit'
-                $remaining = $webResp.Headers.'X-RateLimit-Remaining'
-                $reset = $webResp.Headers.'X-RateLimit-Reset'
-                $retryAfter = $webResp.Headers.'Retry-After'
-                if ($limit -or $remaining -or $reset -or $retryAfter) {
-                    $parts = @()
-                    if ($remaining -and $limit) { $parts += "remaining=$remaining/$limit" }
-                    elseif ($limit) { $parts += "limit=$limit" }
-                    elseif ($remaining) { $parts += "remaining=$remaining" }
-                    if ($reset) {
-                        $nowEpoch = [int](Get-Date -UFormat %s)
-                        $wait = [int]$reset - $nowEpoch
-                        if ($wait -lt 0) { $wait = 0 }
-                        $parts += "reset_epoch=$reset; in ${wait}s"
-                    }
-                    if ($retryAfter) { $parts += "retry_after=${retryAfter}s" }
-                    Write-Diagnostic ("Rate: " + ($parts -join " ; "))
-                }
-            }
-
-            # If status is 2xx, parse and return
-            if ($statusCode -ne $null -and $statusCode -ge 200 -and $statusCode -lt 300) {
-                $content = $webResp.Content
-                if ($content -and $content.Trim() -ne '') {
-                    try {
-                        $resp = $content | ConvertFrom-Json -ErrorAction Stop
-                    } catch {
-                        $resp = $content
-                    }
-                } else {
-                    $resp = $null
-                }
-                return $resp
-            }
-
-            # Non-2xx response: log body preview and decide whether to wait/retry
-            $body = $webResp.Content
-            if ($body) {
-                Write-Diagnostic "GitHub API returned HTTP $statusCode for $Url"
-                Write-Diagnostic "Response body preview:"
-                $preview = $body.Substring(0,[Math]::Min(800,$body.Length))
-                $preview -split "`n" | ForEach-Object { Write-Host $_ }
-                Write-Host ""
-            } else {
-                Write-Diagnostic "GitHub API returned HTTP $statusCode for $Url (no body)"
-            }
-
-            # Extract headers for retry logic
-            $retryAfter = $null
-            $rateReset = $null
+            # If Invoke-RestMethod failed, try to get the response object to inspect headers/body
             try {
-                if ($webResp.Headers) {
-                    if ($webResp.Headers['Retry-After']) { $retryAfter = [int]$webResp.Headers['Retry-After'] }
-                    if ($webResp.Headers['X-RateLimit-Reset']) { $rateReset = [int]$webResp.Headers['X-RateLimit-Reset'] }
-                    if ($webResp.Headers['X-RateLimit-Remaining']) {
-                        $rem = $webResp.Headers['X-RateLimit-Remaining']
-                        $lim = $webResp.Headers['X-RateLimit-Limit']
-                        if ($rem -eq '0') {
-                            # If remaining is zero, prefer waiting until reset
-                            if ($rateReset) {
-                                $nowEpoch = [int](Get-Date -UFormat %s)
-                                $wait = $rateReset - $nowEpoch
-                                if ($wait -gt 0) {
-                                    Write-Diagnostic "Rate limit exhausted; waiting $wait seconds until reset (epoch $rateReset). Attempt $attempt of $maxAttempts."
-                                    Start-Sleep -Seconds $wait
-                                }
-                            }
-                        }
-                    }
-                }
+                $webResp = Invoke-WebRequest -Uri $Url -Headers $headers -Method Get -ErrorAction SilentlyContinue
             } catch {
-                # ignore header extraction errors
+                $webResp = $null
             }
 
-            # Honor Retry-After if present
-            if ($retryAfter -ne $null -and $retryAfter -gt 0) {
-                Write-Diagnostic "Server asked to retry after $retryAfter seconds. Attempt $attempt of $maxAttempts."
-                Start-Sleep -Seconds $retryAfter
-            } else {
-                # Exponential backoff for other HTTP errors (if we will retry)
-                if ($attempt -lt $maxAttempts) {
-                    $delay = $baseDelaySeconds * [math]::Pow(2, $attempt - 1)
-                    Write-Diagnostic "HTTP $statusCode received. Backing off $delay seconds. Attempt $attempt of $maxAttempts."
-                    Start-Sleep -Seconds $delay
+            if ($webResp -ne $null) {
+                $statusCode = $null
+                try { $statusCode = [int]$webResp.StatusCode } catch {}
+                $hdrs = Headers-ToHashtable $webResp.Headers
+                if ($hdrs['X-RateLimit-Remaining']) { $lastSeenRemaining = $hdrs['X-RateLimit-Remaining'] }
+
+                # Save body and headers for debugging
+                $body = $webResp.Content
+                Save-DebugResponse -Prefix $DebugPrefix -Body ($body -as [string]) -Hdrs $hdrs -StatusCode $statusCode
+
+                # Log preview
+                if ($body) {
+                    Write-Diagnostic ("GitHub API returned HTTP $statusCode for $Url")
+                    $preview = $body.Substring(0,[Math]::Min(800,$body.Length))
+                    $preview -split "`n" | ForEach-Object { Write-Host $_ }
+                    Write-Host ""
+                } else {
+                    Write-Diagnostic ("GitHub API returned HTTP $statusCode for $Url (no body)")
                 }
-            }
 
-            if ($attempt -ge $maxAttempts) {
-                throw "HTTP $statusCode returned for $Url after $attempt attempts."
-            } else {
-                continue
-            }
-        }
-
-        # If we reach here, Invoke-WebRequest did not return a response object (network-level error)
-        try {
-            # Re-run to get exception details (this will throw)
-            $null = Invoke-WebRequest -Uri $Url -Headers $headers -Method Get -ErrorAction Stop
-        } catch [System.Net.WebException] {
-            $we = $_.Exception
-            # Try to extract headers from the WebException response if available and log them
-            try {
-                if ($we.Response -ne $null) {
-                    $respHeaders = $we.Response.Headers
-                    $retryAfter = if ($respHeaders['Retry-After']) { [int]$respHeaders['Retry-After'] } else { $null }
-                    $rateReset = if ($respHeaders['X-RateLimit-Reset']) { [int]$respHeaders['X-RateLimit-Reset'] } else { $null }
-                    $rem = if ($respHeaders['X-RateLimit-Remaining']) { $respHeaders['X-RateLimit-Remaining'] } else { $null }
-                    $lim = if ($respHeaders['X-RateLimit-Limit']) { $respHeaders['X-RateLimit-Limit'] } else { $null }
-
-                    if ($lim -or $rem -or $rateReset -or $retryAfter) {
-                        $parts = @()
-                        if ($rem -and $lim) { $parts += "remaining=$rem/$lim" }
-                        elseif ($rem) { $parts += "remaining=$rem" }
-                        elseif ($lim) { $parts += "limit=$lim" }
-                        if ($rateReset) {
-                            $nowEpoch = [int](Get-Date -UFormat %s)
-                            $wait = [int]$rateReset - $nowEpoch
-                            if ($wait -lt 0) { $wait = 0 }
-                            $parts += "reset_epoch=$rateReset; in ${wait}s"
-                        }
-                        if ($retryAfter) { $parts += "retry_after=${retryAfter}s" }
-                        Write-Diagnostic ("Rate (error): " + ($parts -join " ; "))
-                    }
-
-                    # If Retry-After present, honor it
-                    if ($retryAfter -ne $null -and $retryAfter -gt 0) {
-                        Write-Diagnostic "Rate limit or server asked to retry after $retryAfter seconds. Attempt $attempt of $maxAttempts."
-                        Start-Sleep -Seconds $retryAfter
-                    } elseif ($rateReset -ne $null) {
+                # Honor Retry-After or X-RateLimit-Reset if present
+                $retryAfter = $null
+                $rateReset = $null
+                try {
+                    if ($hdrs['Retry-After']) { $retryAfter = [int]$hdrs['Retry-After'] }
+                    if ($hdrs['X-RateLimit-Reset']) { $rateReset = [int]$hdrs['X-RateLimit-Reset'] }
+                    if ($hdrs['X-RateLimit-Remaining'] -and $hdrs['X-RateLimit-Remaining'] -eq '0' -and $rateReset) {
                         $nowEpoch = [int](Get-Date -UFormat %s)
                         $wait = $rateReset - $nowEpoch
                         if ($wait -gt 0) {
-                            Write-Diagnostic "Rate limit reset at epoch $rateReset (in $wait seconds). Attempt $attempt of $maxAttempts."
-                            Start-Sleep -Seconds $wait
+                            Write-Diagnostic "Rate limit exhausted; waiting $wait seconds until reset (epoch $rateReset). Attempt $attempt of $maxAttempts."
+                            Start-Sleep -Seconds ($wait + 2)
                         }
                     }
-                }
-            } catch {
-                # ignore header extraction errors
-            }
+                } catch {}
 
-            # Exponential backoff for network errors
-            if ($attempt -lt $maxAttempts) {
-                $delay = $baseDelaySeconds * [math]::Pow(2, $attempt - 1)
-                Write-Diagnostic "Network error calling GitHub API: $($we.Message). Backing off $delay seconds. Attempt $attempt of $maxAttempts."
-                Start-Sleep -Seconds $delay
-                continue
+                if ($retryAfter -ne $null -and $retryAfter -gt 0) {
+                    Write-Diagnostic "Server asked to retry after $retryAfter seconds. Attempt $attempt of $maxAttempts."
+                    Start-Sleep -Seconds $retryAfter
+                } else {
+                    if ($attempt -lt $maxAttempts) {
+                        $delay = [math]::Min(300, $baseDelaySeconds * [math]::Pow(2, $attempt - 1))
+                        Write-Diagnostic "HTTP $statusCode received. Backing off $delay seconds. Attempt $attempt of $maxAttempts."
+                        Start-Sleep -Seconds $delay
+                    }
+                }
+
+                if ($attempt -ge $maxAttempts) {
+                    throw "HTTP $statusCode returned for $Url after $attempt attempts."
+                } else {
+                    continue
+                }
             } else {
-                throw
-            }
-        } catch {
-            # Other exceptions
-            if ($attempt -lt $maxAttempts) {
-                $delay = $baseDelaySeconds * [math]::Pow(2, $attempt - 1)
-                Write-Diagnostic "Error calling GitHub API: $($_.Exception.Message). Backing off $delay seconds. Attempt $attempt of $maxAttempts."
-                Start-Sleep -Seconds $delay
-                continue
-            } else {
-                throw
+                # No web response object; treat as network error and back off
+                if ($attempt -lt $maxAttempts) {
+                    $delay = [math]::Min(300, $baseDelaySeconds * [math]::Pow(2, $attempt - 1))
+                    Write-Diagnostic "Network error calling GitHub API: $($_.Exception.Message). Backing off $delay seconds. Attempt $attempt of $maxAttempts."
+                    Start-Sleep -Seconds $delay
+                    continue
+                } else {
+                    throw $_
+                }
             }
         }
     }
 }
 
-# Normalize accounts list
-$accountList = $Accounts -split '[, ]+' | Where-Object { $_ -ne '' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+# Normalize accounts list and ensure array
+$accountList = @($Accounts -split '[, ]+' | Where-Object { $_ -ne '' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 if ($accountList.Count -eq 0) {
     Write-DiagnosticError "No valid accounts provided in -Accounts parameter."
     exit 2
@@ -270,23 +279,55 @@ if ($accountList.Count -eq 0) {
 
 # Collect repo entries
 $allRepos = @()
+$lastRemaining = $null
+
+# Initial global check (tolerant)
+try { Check-GlobalRateLimit | Out-Null } catch {}
 
 foreach ($acct in $accountList) {
     Write-Host "Fetching repos for: $acct"
 
+    # Check global rate limit before each account (best-effort)
+    try {
+        $global = Check-GlobalRateLimit
+        if ($global -and $global.Remaining -and $global.Remaining -eq '0' -and $global.Reset) {
+            $nowEpoch = [int](Get-Date -UFormat %s)
+            $wait = [int]$global.Reset - $nowEpoch
+            if ($wait -gt 0) {
+                Write-Diagnostic "Global rate limit exhausted before fetching $acct; waiting $wait seconds until reset."
+                Start-Sleep -Seconds ($wait + 2)
+            }
+        }
+    } catch {}
+
     $listUrl = "https://api.github.com/users/$acct/repos?per_page=100"
     try {
-        $repos = Invoke-GitHubApi -Url $listUrl
+        $reposResult = Invoke-GitHubJson -Url $listUrl -DebugPrefix ("list_{0}" -f $acct)
+        if ($null -eq $reposResult) { throw "No response for $acct" }
+        $repos = $reposResult.Result
+        $lastRemaining = $reposResult.Remaining
     } catch {
         Write-DiagnosticWarning "Warning: Account '$acct' not found or inaccessible (HTTP error)."
-        # End of iteration: print exactly one empty line then continue
         Write-Host ""
         continue
     }
 
+    # Defensive: ensure $repos is an array
+    if ($null -eq $repos) {
+        Write-DiagnosticWarning "No repository list returned for $acct; skipping."
+        Write-Host ""
+        continue
+    }
+    if (-not ($repos -is [System.Collections.IEnumerable])) {
+        # Single-object response; wrap into array
+        $repos = @($repos)
+    }
+
     if ($SaveDebugFiles) {
-        $listFile = Join-Path $debugDir ("list_{0}.json" -f $acct)
-        try { $repos | ConvertTo-Json -Depth 10 | Out-File -FilePath $listFile -Encoding UTF8 } catch {}
+        try {
+            $listFile = Join-Path $debugDir ("list_{0}.json" -f $acct)
+            $repos | ConvertTo-Json -Depth 10 | Out-File -FilePath $listFile -Encoding UTF8
+        } catch {}
     }
 
     foreach ($r in $repos) {
@@ -297,22 +338,21 @@ foreach ($acct in $accountList) {
         $repoName = $r.name
         $detailUrl = "https://api.github.com/repos/$owner/$repoName"
         try {
-            # Try to fetch full repo detail (may include parent/source for forks)
-            $detail = Invoke-GitHubApi -Url $detailUrl
+            $detailResult = Invoke-GitHubJson -Url $detailUrl -DebugPrefix ("detail_{0}_{1}" -f $owner, $repoName)
+            $detail = $detailResult.Result
         } catch {
-            # If detail fetch fails (common for some forks or rate-limited responses),
-            # fall back to using the list-item data ($r) so we still include the repo.
             Write-DiagnosticWarning "Warning: Failed to fetch details for $owner/$repoName. Using list data and continuing."
             $detail = $r
         }
 
         if ($SaveDebugFiles) {
-            $safeName = ($owner + '_' + $repoName) -replace '[\\/:*?""<>| ]','_'
-            $detailFile = Join-Path $debugDir ("detail_{0}.json" -f $safeName)
-            try { $detail | ConvertTo-Json -Depth 20 | Out-File -FilePath $detailFile -Encoding UTF8 } catch {}
+            try {
+                $safeName = ($owner + '_' + $repoName) -replace '[\\/:*?""<>| ]','_'
+                $detailFile = Join-Path $debugDir ("detail_{0}.json" -f $safeName)
+                $detail | ConvertTo-Json -Depth 20 | Out-File -FilePath $detailFile -Encoding UTF8
+            } catch {}
         }
 
-        # Safe extraction of optional properties
         $parentObj = $null
         if ($detail -and $detail.PSObject.Properties.Name -contains 'parent') {
             $parentObj = $detail.parent
@@ -340,7 +380,11 @@ foreach ($acct in $accountList) {
         }
     }
 
-    # End of iteration: print exactly one empty line
+    # Print per-account rate status if available
+    if ($lastRemaining) {
+        Write-Diagnostic ("Account ${acct}: last seen X-RateLimit-Remaining = $lastRemaining")
+    }
+
     Write-Host ""
 }
 
