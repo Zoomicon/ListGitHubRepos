@@ -1,89 +1,113 @@
 @echo off
-REM ListGitHubRepos.bat
-REM Constants are defined here; edit them instead of using environment variables.
+REM ===== Fixed ListGitHubRepos_Run.bat =====
+REM Robust runner: no nested parenthesized blocks, all literal parentheses escaped.
+
 setlocal
 
-set "SCRIPT=%~dp0ListGitHubRepos.ps1"
-
-REM --- Configuration constants (edit these) ---
-set "GITHUB_TOKEN="        REM <-- put your token here, keep this file private
-set "HIDE_FORKS=0"
-set "SKIP_DOT=0"
-set "SAVE_DEBUG=1"         REM enable saving debug responses
+REM --- Config (edit if desired) ---
+set "SCRIPT_PATH=%~dp0ListGitHubRepos.ps1"
+set "GITHUB_TOKEN="        REM optional: paste token here to avoid 403s
 set "MAX_ATTEMPTS=4"
 set "EXCLUDE_NAMES=.github"
-set "SHOW_STARS=0"
-set "SHOW_FORKS=0"
-set "STARS_LABEL=Stars:"
-set "FORKS_LABEL=Forks:"
-set "ITALIC_NAMES=.github"
 
-if "%~1"=="/?" goto help
-if "%~1"=="-h" goto help
+REM --- Parse args ---
+set "NOLOG=0"
+set "QUIET=0"
+set "ACCS="
+:arg_loop
+if "%~1"=="" goto args_done
+if "%~1"=="-nolog" set "NOLOG=1" & shift & goto arg_loop
+if "%~1"=="-quiet" set "QUIET=1" & shift & goto arg_loop
+if defined ACCS ( set "ACCS=%ACCS% %~1" ) else ( set "ACCS=%~1" )
+shift
+goto arg_loop
+:args_done
 
-goto collect_args
-
-:collect_args
-REM Prompt for accounts (quoted form preserves ":" and trailing space)
-if "%~1"=="" (
-    set /p "ACCOUNTS=Enter GitHub accounts (comma or space separated): "
-) else (
-    set "ACCOUNTS=%*"
+REM --- Prompt if no accounts provided ---
+if not defined ACCS (
+  set /p "ACCS=Enter GitHub accounts (space separated): "
 )
 
-REM Export token and debug dir as environment variables for PowerShell
-if not "%GITHUB_TOKEN%"=="" set "GITHUB_TOKEN=%GITHUB_TOKEN%"
+REM --- Sanitize input ---
+set "ACCS=%ACCS:"=%"
+set "ACCS=%ACCS:,= %"
+:trim_spaces
+set "OLDACCS=%ACCS%"
+set "ACCS=%ACCS:  = %"
+if not "%ACCS%"=="%OLDACCS%" goto trim_spaces
+
+REM --- Timestamps and paths (safe calls before conditionals) ---
+for /f "usebackq delims=" %%T in (`powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"`) do set "TS=%%T"
+for /f "usebackq delims=" %%T in (`powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss' "`) do set "RUN_TS=%%T"
+
+set "LOGDIR=%~dp0logs"
+if not exist "%LOGDIR%" mkdir "%LOGDIR%"
+set "LOGFILE=%LOGDIR%\run_%TS%.log"
 set "DEBUG_DIR=%~dp0repo-debug"
 
-REM Build PowerShell argument string (use CALL SET to avoid parser issues)
-set "PSARGS=-NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Accounts "%ACCOUNTS%""
+if not "%GITHUB_TOKEN%"=="" set "GITHUB_TOKEN=%GITHUB_TOKEN%"
 
-if "%HIDE_FORKS%"=="1" call set "PSARGS=%%PSARGS%% -HideForks"
-if "%SKIP_DOT%"=="1" call set "PSARGS=%%PSARGS%% -SkipDotPrefix"
-if "%SAVE_DEBUG%"=="1" call set "PSARGS=%%PSARGS%% -SaveDebugFiles"
+REM --- Header (single-line ifs only; literal parentheses escaped where present) ---
+if "%QUIET%"=="0" echo =====================================================
+if "%QUIET%"=="0" echo ListGitHubRepos runner
+if "%QUIET%"=="0" echo Timestamp: %RUN_TS%
+if "%QUIET%"=="0" echo Accounts: %ACCS%
+if "%QUIET%"=="0" if "%NOLOG%"=="1" (echo Logging: OFF) else (echo Logging: ON - log file: "%LOGFILE%")
+if "%QUIET%"=="0" echo Verbose messages: ON
+if "%QUIET%"=="0" echo =====================================================
+if "%QUIET%"=="0" echo.
 
-if not "%MAX_ATTEMPTS%"=="" call set "PSARGS=%%PSARGS%% -MaxAttempts %MAX_ATTEMPTS%"
+REM --- Run path selection (explicit GOTOs; no nested blocks) ---
+if "%NOLOG%"=="1" goto RUN_NOLOG
+goto RUN_LOG
 
-if not "%EXCLUDE_NAMES%"=="" (
-    call set "PSARGS=%%PSARGS%% -ExcludeNames "%EXCLUDE_NAMES%""
-)
+:RUN_NOLOG
+if "%QUIET%"=="0" echo Running (no log) for accounts: %ACCS%
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_PATH%" -Accounts "%ACCS%" -SaveDebugFiles -MaxAttempts %MAX_ATTEMPTS% -ExcludeNames "%EXCLUDE_NAMES%"
+call set "EXITCODE=%%ERRORLEVEL%%"
+goto AFTER_RUN
 
-if "%SHOW_STARS%"=="1" call set "PSARGS=%%PSARGS%% -ShowStars"
-if "%SHOW_FORKS%"=="1" call set "PSARGS=%%PSARGS%% -ShowForks"
+:RUN_LOG
+if "%QUIET%"=="0" echo Running (logging) for accounts: %ACCS% and writing to %LOGFILE%
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_PATH%" -Accounts "%ACCS%" -SaveDebugFiles -MaxAttempts %MAX_ATTEMPTS% -ExcludeNames "%EXCLUDE_NAMES%" > "%LOGFILE%" 2>&1
+call set "EXITCODE=%%ERRORLEVEL%%"
+goto AFTER_RUN
 
-if not "%STARS_LABEL%"=="" (
-    call set "PSARGS=%%PSARGS%% -StarsLabel "%STARS_LABEL%""
-)
+:AFTER_RUN
+REM --- Summary (single-line ifs only; avoid nested inline ifs with literal parentheses) ---
+if "%QUIET%"=="0" echo.
+if "%QUIET%"=="0" echo ==== RUN SUMMARY ====
+if "%QUIET%"=="0" if "%NOLOG%"=="1" goto LOG_DISABLED
+if "%QUIET%"=="0" echo Log file: %LOGFILE%
+goto LOG_AFTER
 
-if not "%FORKS_LABEL%"=="" (
-    call set "PSARGS=%%PSARGS%% -ForksLabel "%FORKS_LABEL%""
-)
+:LOG_DISABLED
+if "%QUIET%"=="0" echo Log file: ^(disabled^)
+:LOG_AFTER
 
-if not "%ITALIC_NAMES%"=="" (
-    call set "PSARGS=%%PSARGS%% -ItalicNames "%ITALIC_NAMES%""
-)
-
-echo.
-echo Running PowerShell:
-echo powershell.exe %PSARGS%
-echo.
-
-powershell.exe %PSARGS%
-set "EXITCODE=%ERRORLEVEL%"
-
-if "%EXITCODE%"=="0" (
-    if exist "%~dp0GitHubRepos.html" (
-        start "" "%~dp0GitHubRepos.html"
-    )
+if "%QUIET%"=="0" if exist "%~dp0GitHubRepos.html" (
+  echo Generated HTML: %~dp0GitHubRepos.html
+  echo Opening HTML...
+  start "" "%~dp0GitHubRepos.html"
 ) else (
-    echo PowerShell failed with exit code %EXITCODE%.
+  if "%QUIET%"=="0" echo Generated HTML: (not found)
 )
+
+if "%QUIET%"=="0" if exist "%~dp0repo-debug" echo Repo debug files: %~dp0repo-debug
+if "%QUIET%"=="0" echo Exit code: %EXITCODE%
+if "%QUIET%"=="0" echo ====================
+if "%QUIET%"=="0" echo.
+
+REM --- Show preview outside any multi-line block ---
+if "%NOLOG%"=="0" call :ShowLogPreview
 
 endlocal
 exit /b %EXITCODE%
 
-:help
-echo Usage: ListGitHubRepos.bat [accounts]
-echo.
-echo Edit the constants at the top of this file to change behavior; do not rely on environment variables.
-exit /b 0
+:ShowLogPreview
+  if exist "%LOGFILE%" (
+    powershell -NoProfile -Command "if (Test-Path '%LOGFILE%') { Get-Content -Path '%LOGFILE%' -TotalCount 30 }" 2>nul
+  ) else (
+    echo (no log file found)
+  )
+  goto :eof

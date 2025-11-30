@@ -1,447 +1,473 @@
 ﻿<#
-.SYNOPSIS
-  ListGitHubRepos.ps1
-.DESCRIPTION
-  Fetches public repositories for one or more GitHub accounts and generates GitHubRepos.html.
-  Uses GITHUB_TOKEN from environment if set.
+ListGitHubRepos.ps1
+
+Robust script to list GitHub repos for one or more accounts and produce an HTML summary.
+License links are resolved by querying the repository license endpoint; the script does NOT assume /LICENSE.
+Fork parent license and repo links are shown inline in parentheses.
 #>
 
 param(
-    [Parameter(Mandatory=$true)]
-    [string]$Accounts,
+    [Parameter(Mandatory=$false)]
+    [string]$Accounts = "",
 
-    [switch]$HideForks,
-    [switch]$SkipDotPrefix,
+    [Parameter(Mandatory=$false)]
+    [bool]$ShowProgress = $true,
+
+    [Parameter(Mandatory=$false)]
     [switch]$SaveDebugFiles,
 
+    [Parameter(Mandatory=$false)]
     [int]$MaxAttempts = 4,
 
-    [string]$ExcludeNames = ".github",
-    [string]$ItalicNames = ".github",
+    [Parameter(Mandatory=$false)]
+    [int]$DetailRequestDelayMs = 2000,
 
+    [Parameter(Mandatory=$false)]
+    [string]$ExcludeNames = '.github',
+
+    [Parameter(Mandatory=$false)]
     [switch]$ShowStars,
-    [switch]$ShowForks,
-    [string]$StarsLabel = "Stars:",
-    [string]$ForksLabel = "Forks:"
+
+    [Parameter(Mandatory=$false)]
+    [switch]$ShowForks
 )
-
-if ($env:GH_MAX_RETRIES -and $env:GH_MAX_RETRIES.Trim() -ne '') {
-    try { $MaxAttempts = [int]$env:GH_MAX_RETRIES } catch {}
-}
-
-if ($MaxAttempts -lt 1) { $MaxAttempts = 1 }
-elseif ($MaxAttempts -gt 20) { $MaxAttempts = 20 }
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Write-Diagnostic { param([string]$Message) Write-Host $Message }
-function Write-DiagnosticWarning { param([string]$Message) Write-Warning $Message }
-function Write-DiagnosticError { param([string]$Message) Write-Error $Message }
+# Paths
+$ScriptDir = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
+if (-not $ScriptDir) { $ScriptDir = (Get-Location).Path }
+$HtmlOut = Join-Path -Path $ScriptDir -ChildPath 'GitHubRepos.html'
+$DebugDir = Join-Path -Path $ScriptDir -ChildPath 'repo-debug'
+$LogTimestamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
 
-$headers = @{ 'User-Agent' = 'ListGitHubReposScript' }
-if ($env:GITHUB_TOKEN -and $env:GITHUB_TOKEN.Trim() -ne '') {
-    $headers['Authorization'] = "token $($env:GITHUB_TOKEN.Trim())"
-} else {
-    Write-Diagnostic "No GITHUB_TOKEN set (unauthenticated requests)"
+function Encode-Html { param([string]$Text) if ($null -eq $Text) { return '' } return [System.Net.WebUtility]::HtmlEncode([string]$Text) }
+
+# If no accounts, create a minimal HTML and exit cleanly
+if ([string]::IsNullOrWhiteSpace($Accounts)) {
+    Write-Host "No accounts provided. Use -Accounts 'user1 user2' or set the Accounts parameter." -ForegroundColor Yellow
+    "<!doctype html>`n<html><body><h1>No accounts provided</h1></body></html>" | Out-File -FilePath $HtmlOut -Encoding UTF8
+    Write-Host ("Generated HTML: {0}" -f $HtmlOut)
+    exit 0
 }
 
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$outputHtml = Join-Path $scriptDir 'GitHubRepos.html'
-$debugDir = if ($env:DEBUG_DIR -and $env:DEBUG_DIR.Trim() -ne '') { $env:DEBUG_DIR } else { Join-Path $scriptDir 'repo-debug' }
+# Normalize accounts input and preserve order
+$Accounts = $Accounts -replace ',', ' '
+$AccountList = $Accounts -split '\s+' | Where-Object { $_ -ne '' }
 
+# Prepare debug folder if requested
 if ($SaveDebugFiles) {
-    if (-not (Test-Path $debugDir)) { New-Item -Path $debugDir -ItemType Directory | Out-Null }
-}
-
-function Save-DebugResponse {
-    param([string]$Prefix, [string]$Body, [hashtable]$Hdrs = $null, [int]$StatusCode = $null)
-    if (-not $SaveDebugFiles) { return }
     try {
-        $safePrefix = ($Prefix -replace '[\\/:*?""<>| ]','_')
-        $time = (Get-Date).ToString('yyyyMMdd_HHmmss')
-        $fileBase = Join-Path $debugDir ("{0}_{1}" -f $safePrefix, $time)
-        $hdrFile = $fileBase + ".headers.txt"
-        $bodyFile = $fileBase + ".body.txt"
-        if ($Hdrs) {
-            $out = @()
-            if ($StatusCode) { $out += "StatusCode: $StatusCode" }
-            foreach ($k in $Hdrs.Keys) { $out += ("{0}: {1}" -f $k, $Hdrs[$k]) }
-            $out | Out-File -FilePath $hdrFile -Encoding UTF8
+        if (-not (Test-Path -Path $DebugDir)) {
+            New-Item -Path $DebugDir -ItemType Directory -Force | Out-Null
         }
-        $Body | Out-File -FilePath $bodyFile -Encoding UTF8
-        Write-Diagnostic ("Saved debug files: " + (Split-Path $hdrFile -Leaf) + ", " + (Split-Path $bodyFile -Leaf))
     } catch {
-        Write-DiagnosticWarning "Failed to save debug response."
+        Write-Host ("Warning: could not create debug directory {0}: {1}" -f $DebugDir, $_.Exception.Message) -ForegroundColor Yellow
+        $SaveDebugFiles = $false
     }
 }
 
-function Headers-ToHashtable {
-    param([object]$Headers)
-    $ht = @{}
-    if ($null -eq $Headers) { return $ht }
+# --- GitHub helpers ---
+function Get-GitHub {
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [int]$Attempt = 1
+    )
+    $token = $env:GITHUB_TOKEN
+    # Include topics preview in Accept so repo topics are returned when fetching details
+    $acceptHeader = 'application/vnd.github.mercy-preview+json, application/vnd.github.v3+json'
+    $headers = @{
+        'User-Agent' = 'ListGitHubReposScript'
+        'Accept'     = $acceptHeader
+    }
+    if ($token) { $headers['Authorization'] = "token $token" }
+
     try {
-        foreach ($name in $Headers.Keys) {
-            $ht[$name] = $Headers[$name]
-        }
+        return Invoke-RestMethod -Uri $Uri -Headers $headers -Method Get -ErrorAction Stop
     } catch {
+        # Try to extract HTTP status code if available
+        $status = $null
+        try { if ($_.Exception.Response -ne $null) { $status = [int]$_.Exception.Response.StatusCode } } catch {}
+        if ($status -eq 403) {
+            Write-Host ("GitHub returned 403 Forbidden for {0}. Check rate limits or GITHUB_TOKEN." -f $Uri) -ForegroundColor Red
+            return $null
+        }
+        if ($Attempt -lt $MaxAttempts) {
+            $wait = [math]::Min(5 * $Attempt, 30)
+            Write-Host ("Request failed for {0} (attempt {1}). Retrying in {2} seconds..." -f $Uri, $Attempt, $wait) -ForegroundColor Yellow
+            Start-Sleep -Seconds $wait
+            return Get-GitHub -Uri $Uri -Attempt ($Attempt + 1)
+        } else {
+            Write-Host ("Request failed for {0} after {1} attempts: {2}" -f $Uri, $MaxAttempts, $_.Exception.Message) -ForegroundColor Red
+            return $null
+        }
+    }
+}
+
+function Get-GitHubPaged {
+    param([Parameter(Mandatory=$true)][string]$BaseUri)
+    $results = @()
+    $page = 1
+    while ($true) {
+        $uri = "$BaseUri`?per_page=100&page=$page"
+        $resp = Get-GitHub -Uri $uri
+        if ($null -eq $resp) { break }
+
+        # Detect error-like payloads
+        if ($resp -is [System.Management.Automation.PSCustomObject] -and $resp.PSObject.Properties.Name -contains 'message') {
+            Write-Host ("GitHub API returned an error for {0}: {1}" -f $uri, $resp.message) -ForegroundColor Yellow
+            break
+        }
+
+        $items = @($resp)
+        $itemCount = ($items | Measure-Object).Count
+        if ($itemCount -gt 0) { $results += $items }
+        if ($itemCount -lt 100) { break }
+        $page++
+    }
+    return $results
+}
+
+function Save-Debug {
+    param([Parameter(Mandatory=$true)][string]$FileName, [Parameter(Mandatory=$true)][object]$Content)
+    if (-not $SaveDebugFiles) { return }
+    $path = Join-Path -Path $DebugDir -ChildPath $FileName
+    try {
+        $json = $null
+        try { $json = $Content | ConvertTo-Json -Depth 10 -ErrorAction Stop } catch { try { $json = $Content | ConvertTo-Json -Depth 4 -ErrorAction SilentlyContinue } catch { $json = $Content | Out-String } }
+        $json | Out-File -FilePath $path -Encoding UTF8
+    } catch {
+        Write-Host ("Warning: failed to save debug file {0}: {1}" -f $path, $_.Exception.Message) -ForegroundColor Yellow
+    }
+}
+
+function Get-ReposForAccount {
+    param([Parameter(Mandatory=$true)][string]$Account)
+    $base = "https://api.github.com/users/$Account/repos"
+    $repos = Get-GitHubPaged -BaseUri $base
+    if ($null -eq $repos) { return @() }
+    return @($repos)
+}
+
+function Get-RepoDetails {
+    param([Parameter(Mandatory=$true)][string]$Owner, [Parameter(Mandatory=$true)][string]$RepoName)
+    $uri = "https://api.github.com/repos/$Owner/$RepoName"
+    $detail = Get-GitHub -Uri $uri
+    if ($null -eq $detail) {
+        Write-Host ("Warning: failed to fetch details for {0}/{1}. Using summary info if available." -f $Owner, $RepoName) -ForegroundColor Yellow
+        return $null
+    }
+    if ($detail -is [System.Management.Automation.PSCustomObject] -and $detail.PSObject.Properties.Name -contains 'message') {
+        Write-Host ("Warning: GitHub returned an error for {0}/{1}: {2}" -f $Owner, $RepoName, $detail.message) -ForegroundColor Yellow
+        return $null
+    }
+    return $detail
+}
+
+# New: resolve license link by querying the repository license endpoint (does not assume /LICENSE)
+function Resolve-LicenseForRepo {
+    param(
+        [Parameter(Mandatory=$true)][psobject]$RepoObj
+    )
+    # Returns hashtable: @{ Name = 'MIT License'; Link = 'https://...' } or $null
+    try {
+        # If the repo object already contains license info with a name, capture it
+        $licenseName = $null
+        if ($null -ne $RepoObj.license) {
+            if ($RepoObj.license.name) { $licenseName = $RepoObj.license.name }
+            elseif ($RepoObj.license.spdx_id) { $licenseName = $RepoObj.license.spdx_id }
+        }
+
+        # Try the dedicated license endpoint: /repos/{owner}/{repo}/license
+        if ($null -ne $RepoObj.full_name) {
+            $parts = $RepoObj.full_name -split '/'
+            if ($parts.Count -ge 2) {
+                $owner = $parts[0]; $repo = $parts[1]
+                $licenseEndpoint = "https://api.github.com/repos/$owner/$repo/license"
+                $licResp = Get-GitHub -Uri $licenseEndpoint
+                if ($null -ne $licResp -and -not ($licResp -is [string])) {
+                    $licName = $null
+                    try { if ($licResp.license -and $licResp.license.name) { $licName = $licResp.license.name } } catch {}
+                    if (-not $licName -and $licenseName) { $licName = $licenseName }
+                    $licLink = $null
+                    try {
+                        if ($licResp.html_url) { $licLink = $licResp.html_url }
+                        elseif ($licResp.download_url) { $licLink = $licResp.download_url }
+                    } catch {}
+                    if ($licName -or $licLink) {
+                        $out = @{}
+                        $out.Name = $licName
+                        $out.Link = $licLink
+                        return $out
+                    }
+                }
+            }
+        }
+
+        # Fallback: if RepoObj.license has a URL field (API), use it
         try {
-            $Headers | Get-Member -MemberType NoteProperty | ForEach-Object {
-                $n = $_.Name
-                $ht[$n] = $Headers.$n
+            if ($null -ne $RepoObj.license -and $RepoObj.license.url) {
+                $out = @{}
+                $out.Name = $licenseName
+                $out.Link = $RepoObj.license.url
+                return $out
             }
         } catch {}
+
+        # Final fallback: return name only if available
+        try {
+            if ($licenseName) {
+                $out = @{}
+                $out.Name = $licenseName
+                $out.Link = $null
+                return $out
+            }
+        } catch {}
+    } catch {
+        # ignore and return $null
     }
-    return $ht
+    return $null
 }
 
-function Invoke-GitHubJson {
-    param(
-        [Parameter(Mandatory=$true)][string]$Url,
-        [string]$DebugPrefix = "request"
-    )
+# --- HTML generation: list repos sequentially (no account grouping) ---
+function Generate-HTML {
+    param([Parameter(Mandatory=$true)][hashtable]$DataByAccount, [Parameter(Mandatory=$true)][string[]]$AccountOrder)
 
-    $maxAttempts = if ($MaxAttempts -and ($MaxAttempts -is [int])) { $MaxAttempts } else { 4 }
-    $attempt = 0
-    $baseDelaySeconds = 1
-    $lastSeenRemaining = $null
+    $html = New-Object System.Collections.Generic.List[string]
+    $html.Add('<!doctype html>')
+    $html.Add('<html lang="en">')
+    $html.Add('<head>')
+    $html.Add('  <meta charset="utf-8" />')
+    $html.Add('  <meta name="viewport" content="width=device-width, initial-scale=1" />')
+    $html.Add('  <title>GitHub Repositories</title>')
+    $html.Add('  <style>')
+    $html.Add('    body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; }')
+    $html.Add('    h1 { font-size: 1.6em; }')
+    $html.Add('    .repo { margin: 12px 0; }')
+    $html.Add('    .meta { color: #666; font-size: 0.95em; margin-top:4px }')
+    $html.Add('    .tags { margin-top:6px; font-size:0.9em; color:#2b7bb9 }')
+    $html.Add('    hr { border: none; border-top: 1px solid #ddd; margin:12px 0 }')
+    $html.Add('  </style>')
+    $html.Add('</head>')
+    $html.Add('<body>')
+    $html.Add(("  <h1>GitHub Repositories</h1>"))
+    $html.Add(("  <p>Generated: {0}</p>" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')))
 
-    while ($true) {
-        $attempt++
-        try {
-            $resp = Invoke-RestMethod -Uri $Url -Headers $headers -Method Get -ErrorAction Stop
+    foreach ($acct in $AccountOrder) {
+        if (-not $DataByAccount.ContainsKey($acct)) { continue }
+        $repos = @($DataByAccount[$acct])
+        foreach ($r in $repos) {
+            $name = $r.name
+            $desc = if ($r.description) { Encode-Html $r.description } else { '' }
+            $url = $r.html_url
+            $linkText = ("{0}/{1}" -f $acct, $name)
+
+            # fork detection
+            $isFork = $false
+            try { $isFork = [bool]$r.fork } catch { $isFork = $false }
+
+            # Resolve repo license (name + link) using the new helper
+            $repoLicense = Resolve-LicenseForRepo -RepoObj $r
+            $repoLicenseName = $null; $repoLicenseLink = $null
+            if ($null -ne $repoLicense) {
+                $repoLicenseName = $repoLicense.Name
+                $repoLicenseLink = $repoLicense.Link
+            }
+
+            # topics (tags)
+            $topics = @()
+            try { if ($null -ne $r.topics) { $topics = @($r.topics) } } catch { $topics = @() }
+
+            # parent info for forks: prefer parent object if present; otherwise try to fetch parent details
+            $parentHtml = ''
             try {
-                $hdrResp = Invoke-WebRequest -Uri $Url -Headers $headers -Method Get -ErrorAction SilentlyContinue
-                if ($hdrResp -ne $null) {
-                    $hdrs = Headers-ToHashtable $hdrResp.Headers
-                    if ($hdrs['X-RateLimit-Remaining']) { $lastSeenRemaining = $hdrs['X-RateLimit-Remaining'] }
-                }
-            } catch {}
-            return @{ Result = $resp; Remaining = $lastSeenRemaining }
-        } catch {
-            # Enhanced extraction: try to read response from the exception, then fallback to Invoke-WebRequest
-            $webResp = $null
-            $statusCode = $null
-            $hdrs = $null
-            $body = $null
+                if ($isFork) {
+                    $parentObj = $null
+                    if ($null -ne $r.parent) { $parentObj = $r.parent }
+                    else {
+                        # attempt to fetch repo details to get parent (if not present)
+                        $maybe = Get-RepoDetails -Owner $acct -RepoName $name
+                        if ($null -ne $maybe -and $null -ne $maybe.parent) { $parentObj = $maybe.parent }
+                    }
 
-            try {
-                $ex = $_.Exception
-                if ($ex -and $ex.Response) {
-                    $resp = $ex.Response
-                    try { $statusCode = [int]$resp.StatusCode } catch {}
-                    try { $hdrs = Headers-ToHashtable $resp.Headers } catch {}
-                    try {
-                        $stream = $resp.GetResponseStream()
-                        if ($stream) {
-                            $sr = New-Object System.IO.StreamReader($stream)
-                            $body = $sr.ReadToEnd()
-                            $sr.Close()
+                    if ($null -ne $parentObj -and $parentObj.full_name) {
+                        $parentFull = $parentObj.full_name
+                        $parentUrl = $parentObj.html_url
+                        # resolve parent license via helper
+                        $parentLicense = Resolve-LicenseForRepo -RepoObj $parentObj
+                        $parentLicenseName = $null; $parentLicenseLink = $null
+                        if ($null -ne $parentLicense) {
+                            $parentLicenseName = $parentLicense.Name
+                            $parentLicenseLink = $parentLicense.Link
                         }
-                    } catch {}
-                }
-            } catch {}
-
-            if (-not $body) {
-                try {
-                    $webResp = Invoke-WebRequest -Uri $Url -Headers $headers -Method Get -ErrorAction SilentlyContinue
-                    if ($webResp -ne $null) {
-                        try { $statusCode = [int]$webResp.StatusCode } catch {}
-                        $hdrs = Headers-ToHashtable $webResp.Headers
-                        $body = $webResp.Content
-                    }
-                } catch {
-                    $webResp = $null
-                }
-            }
-
-            Save-DebugResponse -Prefix $DebugPrefix -Body ($body -as [string]) -Hdrs $hdrs -StatusCode $statusCode
-
-            if ($statusCode) {
-                Write-Diagnostic ("GitHub API returned HTTP $statusCode for $Url")
-            } else {
-                Write-Diagnostic ("GitHub API returned an error for $Url (no HTTP status available)")
-            }
-
-            $retryAfter = $null
-            $rateReset = $null
-            try {
-                if ($hdrs['Retry-After']) { $retryAfter = [int]$hdrs['Retry-After'] }
-                if ($hdrs['X-RateLimit-Reset']) { $rateReset = [int]$hdrs['X-RateLimit-Reset'] }
-                if ($hdrs['X-RateLimit-Remaining'] -and $hdrs['X-RateLimit-Remaining'] -eq '0' -and $rateReset) {
-                    $nowEpoch = [int](Get-Date -UFormat %s)
-                    $wait = $rateReset - $nowEpoch
-                    if ($wait -gt 0) {
-                        Write-Diagnostic "Rate limit exhausted; waiting $wait seconds until reset (epoch $rateReset). Attempt $attempt of $maxAttempts."
-                        Start-Sleep -Seconds ($wait + 2)
+                        if ($parentLicenseName) {
+                            if ($parentLicenseLink) {
+                                $parentHtml = ("Forked from <a href='{0}' target='_blank'>{1}</a> (<a href='{2}' target='_blank'>{3}</a>)" -f (Encode-Html $parentUrl), (Encode-Html $parentFull), (Encode-Html $parentLicenseLink), (Encode-Html $parentLicenseName))
+                            } else {
+                                $parentHtml = ("Forked from <a href='{0}' target='_blank'>{1}</a> ({2})" -f (Encode-Html $parentUrl), (Encode-Html $parentFull), (Encode-Html $parentLicenseName))
+                            }
+                        } else {
+                            $parentHtml = ("Forked from <a href='{0}' target='_blank'>{1}</a>" -f (Encode-Html $parentUrl), (Encode-Html $parentFull))
+                        }
                     }
                 }
-            } catch {}
+            } catch { $parentHtml = '' }
 
-            if ($retryAfter -ne $null -and $retryAfter -gt 0) {
-                Write-Diagnostic "Server asked to retry after $retryAfter seconds. Attempt $attempt of $maxAttempts."
-                Start-Sleep -Seconds $retryAfter
-            } else {
-                if ($attempt -lt $maxAttempts) {
-                    $delay = [math]::Min(300, $baseDelaySeconds * [math]::Pow(2, $attempt - 1))
-                    Write-Diagnostic "HTTP $statusCode received. Backing off $delay seconds. Attempt $attempt of $maxAttempts."
-                    Start-Sleep -Seconds $delay
+            # meta parts
+            $metaParts = @()
+            if ($ShowStars) { $metaParts += ("Stars: {0}" -f ($r.stargazers_count -as [int])) }
+            if ($ShowForks)  { $metaParts += ("Forks: {0}" -f ($r.forks_count -as [int])) }
+            if ($isFork) { $metaParts += "Fork" }
+            $meta = if ((($metaParts | Measure-Object).Count) -gt 0) { $metaParts -join ' · ' } else { '' }
+
+            # Build HTML for this repo
+            $html.Add("  <div class='repo'>")
+
+            # Repo link (URL) — link text is account/repo
+            $html.Add(("    <a href='{0}' target='_blank'><strong>{1}</strong></a>" -f (Encode-Html $url), (Encode-Html $linkText)))
+
+            # Inline license for the repo (in parentheses after the repo title), not part of the URL
+            if ($repoLicenseName) {
+                if ($repoLicenseLink) {
+                    # Build anchor safely by concatenation to avoid nested -f issues
+                    $licenseAnchor = "<a href='" + (Encode-Html $repoLicenseLink) + "' target='_blank'>" + (Encode-Html $repoLicenseName) + "</a>"
+                    $html.Add(("    <span> ({0})</span>" -f $licenseAnchor))
+                } else {
+                    $html.Add(("    <span> ({0})</span>" -f (Encode-Html $repoLicenseName)))
                 }
             }
 
-            if ($attempt -ge $maxAttempts) {
-                throw "HTTP $statusCode returned for $Url after $attempt attempts."
-            } else {
+            if ($desc) { $html.Add(("    <div class='meta'>{0}</div>" -f $desc)) }
+            if ($meta) { $html.Add(("    <div class='meta'>{0}</div>" -f (Encode-Html $meta))) }
+            if ($parentHtml) { $html.Add(("    <div class='meta'>{0}</div>" -f $parentHtml)) }
+            if ((($topics | Measure-Object).Count) -gt 0) {
+                $html.Add(("    <div class='tags'><em>{0}</em></div>" -f (Encode-Html (($topics -join ', ')))) )
+            }
+
+            $html.Add("  </div>")
+            $html.Add("  <hr />")
+        }
+    }
+
+    $html.Add('</body>')
+    $html.Add('</html>')
+
+    try {
+        $html -join "`n" | Out-File -FilePath $HtmlOut -Encoding UTF8
+        Write-Host ("Generated HTML: {0}" -f $HtmlOut)
+    } catch {
+        Write-Host ("Failed to write HTML file {0}: {1}" -f $HtmlOut, $_.Exception.Message) -ForegroundColor Red
+    }
+}
+
+# --- Main processing (defensive) ---
+$allData = @{}
+$totalAccounts = ($AccountList | Measure-Object).Count
+$acctIndex = 0
+
+foreach ($acct in $AccountList) {
+    $acctIndex++
+    if ($ShowProgress) {
+        $percent = 0
+        if ($totalAccounts -gt 0) { $percent = [int](($acctIndex - 1) / $totalAccounts * 100) }
+        Write-Progress -Activity "Fetching accounts" -Status ("Processing {0} ({1}/{2})" -f $acct, $acctIndex, $totalAccounts) -PercentComplete $percent
+    }
+
+    Write-Host ("Processing account: {0}" -f $acct) -ForegroundColor Cyan
+
+    $repos = @()
+    try {
+        $repos = Get-ReposForAccount -Account $acct
+    } catch {
+        Write-Host ("Warning: unexpected error fetching repos for {0}: {1}" -f $acct, $_.Exception.Message) -ForegroundColor Yellow
+        $repos = @()
+    }
+
+    # Ensure repos is an array and count safely
+    $repos = @($repos)
+    $repoCount = ($repos | Measure-Object).Count
+    if ($repoCount -eq 0) {
+        Write-Host ("No repositories returned for {0}. Skipping." -f $acct) -ForegroundColor Yellow
+        $allData[$acct] = @()
+        continue
+    }
+
+    # Exclude filter
+    if ($ExcludeNames) {
+        $excludes = $ExcludeNames -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        $excludesCount = ($excludes | Measure-Object).Count
+        if ($excludesCount -gt 0) {
+            $repos = @($repos | Where-Object {
+                $keep = $true
+                foreach ($ex in $excludes) { if ($_.name -like "*$ex*") { $keep = $false; break } }
+                $keep
+            })
+            $repoCount = ($repos | Measure-Object).Count
+            if ($repoCount -eq 0) {
+                Write-Host ("No repositories left after filtering for {0}. Skipping." -f $acct) -ForegroundColor Yellow
+                $allData[$acct] = @()
                 continue
             }
         }
     }
-}
-
-# Normalize accounts list and ensure array
-$accountList = @($Accounts -split '[, ]+' | Where-Object { $_ -ne '' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
-if (@($accountList).Count -eq 0) {
-    Write-DiagnosticError "No valid accounts provided in -Accounts parameter."
-    exit 2
-}
-
-# Parse exclude names into an array (case-insensitive)
-$excludedList = @()
-if ($ExcludeNames -and $ExcludeNames.Trim() -ne "") {
-    $excludedList = @($ExcludeNames -split '[, ]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }) | ForEach-Object { $_.ToLowerInvariant() }
-}
-
-# Parse italic names into an array (case-insensitive)
-$italicList = @()
-if ($ItalicNames -and $ItalicNames.Trim() -ne "") {
-    $italicList = @($ItalicNames -split '[, ]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }) | ForEach-Object { $_.ToLowerInvariant() }
-}
-
-# Collect repo entries
-$allRepos = @()
-$lastRemaining = $null
-
-try { Check-GlobalRateLimit | Out-Null } catch {}
-
-foreach ($acct in $accountList) {
-    Write-Host "Fetching repos for: $acct"
-
-    try {
-        $global = Check-GlobalRateLimit
-        if ($global -and $global.Remaining -and $global.Remaining -eq '0' -and $global.Reset) {
-            $nowEpoch = [int](Get-Date -UFormat %s)
-            $wait = [int]$global.Reset - $nowEpoch
-            if ($wait -gt 0) {
-                Write-Diagnostic "Global rate limit exhausted before fetching $acct; waiting $wait seconds until reset."
-                Start-Sleep -Seconds ($wait + 2)
-            }
-        }
-    } catch {}
-
-    $listUrl = "https://api.github.com/users/$acct/repos?per_page=100"
-    try {
-        $reposResult = Invoke-GitHubJson -Url $listUrl -DebugPrefix ("list_{0}" -f $acct)
-        if ($null -eq $reposResult) { throw "No response for $acct" }
-        $repos = $reposResult.Result
-        $lastRemaining = $reposResult.Remaining
-    } catch {
-        Write-DiagnosticWarning "Warning: Account '$acct' not found or inaccessible (HTTP error)."
-        Write-Host ""
-        continue
-    }
-
-    if ($null -eq $repos) {
-        Write-DiagnosticWarning "No repository list returned for $acct; skipping."
-        Write-Host ""
-        continue
-    }
-
-    # Ensure $repos is an array-like collection
-    if (-not ($repos -is [System.Collections.IEnumerable]) -or ($repos -is [string])) {
-        $repos = @($repos)
-    }
-
-    if (@($repos).Count -eq 0) {
-        Write-DiagnosticWarning "Repository list for $acct is empty; skipping."
-        Write-Host ""
-        continue
-    }
 
     if ($SaveDebugFiles) {
-        try {
-            $listFile = Join-Path $debugDir ("list_{0}.json" -f $acct)
-            $repos | ConvertTo-Json -Depth 10 | Out-File -FilePath $listFile -Encoding UTF8
-        } catch {}
+        $file = ("{0}_repos_{1}.json" -f $acct, $LogTimestamp)
+        Save-Debug -FileName $file -Content $repos
     }
 
+    # Fetch details per repo (ensures topics and parent are present)
+    $detailed = New-Object System.Collections.ArrayList
+    $repoIndex = 0
     foreach ($r in $repos) {
-        # Normalize repo name for checks
-        $repoName = $r.name
-
-        # Skip exact-name exclusions (case-insensitive)
-        if (@($excludedList).Count -gt 0 -and (@($excludedList) -contains $repoName.ToLowerInvariant())) {
-            Write-Diagnostic ("Skipping excluded repo by name: " + $repoName)
-            continue
+        $repoIndex++
+        if ($ShowProgress) {
+            $percentRepo = 0
+            if ($repoCount -gt 0) { $percentRepo = [int](($repoIndex - 1) / $repoCount * 100) }
+            Write-Progress -Activity ("Fetching repos for {0}" -f $acct) -Status ("Repo {0}/{1}: {2}" -f $repoIndex, $repoCount, $r.name) -PercentComplete $percentRepo
         }
 
-        if ($SkipDotPrefix -and $repoName.StartsWith('.')) { continue }
-        if ($HideForks -and $r.fork) { continue }
+        $detail = $null
+        try {
+            $detail = Get-RepoDetails -Owner $acct -RepoName $r.name
+        } catch {
+            Write-Host ("Warning: unexpected error fetching details for {0}/{1}: {2}" -f $acct, $r.name, $_.Exception.Message) -ForegroundColor Yellow
+            $detail = $null
+        }
 
-        $owner = $r.owner.login
-
-        # Only fetch details when necessary: forks (to get parent) or missing license info
-        $detail = $r
-        $needDetail = $false
-        if ($r.fork) { $needDetail = $true }
-        if (-not $r.license) { $needDetail = $true }
-
-        if ($needDetail) {
-            $encOwner = [uri]::EscapeDataString($owner)
-            $encRepo  = [uri]::EscapeDataString($repoName)
-            $detailUrl = "https://api.github.com/repos/$encOwner/$encRepo"
-
-            try {
-                $detailResult = Invoke-GitHubJson -Url $detailUrl -DebugPrefix ("detail_{0}_{1}" -f $owner, $repoName)
-                $detail = $detailResult.Result
-            } catch {
-                $status = $null
-                try {
-                    if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-                        $status = [int]$_.Exception.Response.StatusCode
-                    }
-                } catch {}
-
-                if ($status -eq 404) {
-                    Write-Diagnostic ("Repo not found or inaccessible (404): " + "$owner/$repoName. Using list data.")
-                } elseif ($status -ne $null) {
-                    Write-DiagnosticWarning ("Failed to fetch details for $owner/$repoName (HTTP $status). Using list data.")
-                } else {
-                    Write-DiagnosticWarning ("Failed to fetch details for $owner/$repoName. Using list data.")
-                }
-
-                $detail = $r
+        if ($null -ne $detail) {
+            if ($null -eq $detail.topics) { $detail | Add-Member -NotePropertyName topics -NotePropertyValue @() -Force }
+            [void]$detailed.Add($detail)
+            if ($SaveDebugFiles) {
+                $safeName = ($acct + '_' + $r.name) -replace '[\\/:*?"<>|]', '_'
+                Save-Debug -FileName ("{0}_{1}.json" -f $safeName, $LogTimestamp) -Content $detail
             }
+        } else {
+            if ($null -eq $r.topics) { $r | Add-Member -NotePropertyName topics -NotePropertyValue @() -Force }
+            [void]$detailed.Add($r)
         }
 
-        $parentObj = $null
-        if ($detail -and $detail.PSObject.Properties.Name -contains 'parent') {
-            $parentObj = $detail.parent
-        }
-
-        $licenseObj = $null
-        if ($detail -and $detail.PSObject.Properties.Name -contains 'license') {
-            $licenseObj = $detail.license
-        }
-
-        $allRepos += [PSCustomObject]@{
-            Account      = $acct
-            Owner        = $owner
-            Name         = $repoName
-            FullName     = $detail.full_name
-            HtmlUrl      = $detail.html_url
-            Description  = $detail.description
-            Fork         = [bool]$detail.fork
-            License      = $licenseObj
-            Parent       = $parentObj
-            CreatedAt    = $detail.created_at
-            UpdatedAt    = $detail.updated_at
-            Stargazers   = $detail.stargazers_count
-            ForksCount   = $detail.forks_count
-        }
+        if ($DetailRequestDelayMs -gt 0) { Start-Sleep -Milliseconds $DetailRequestDelayMs }
     }
 
-    if ($lastRemaining -ne $null) { Write-Diagnostic ("Account ${acct}: last seen X-RateLimit-Remaining = $lastRemaining") }
-
-    Write-Host ""
+    $allData[$acct] = $detailed
 }
 
-# Generate HTML
-$sb = New-Object System.Text.StringBuilder
-$append = { param($s) [void]$sb.AppendLine($s) }
+if ($ShowProgress) { Write-Progress -Activity "Done" -Completed }
 
-$append.Invoke('<!doctype html>')
-$append.Invoke('<html lang="en">')
-$append.Invoke('<head>')
-$append.Invoke('  <meta charset="utf-8">')
-$append.Invoke('  <meta name="viewport" content="width=device-width,initial-scale=1">')
-$append.Invoke('  <title>GitHub Repos</title>')
-$append.Invoke('  <style>')
-$append.Invoke('    body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#fff;color:#111}')
-$append.Invoke('    .repo{border-bottom:1px solid #ddd;padding:12px 0}')
-$append.Invoke('    .title{font-size:1.1em;font-weight:600}')
-$append.Invoke('    .meta{color:#555;font-size:0.95em;margin-top:6px}')
-$append.Invoke('    .stat{margin-top:8px;font-size:0.95em}')
-$append.Invoke('    .stat strong{display:inline-block;width:70px}')
-$append.Invoke('    em.desc{font-style:italic}')
-$append.Invoke('  </style>')
-$append.Invoke('</head>')
-$append.Invoke('<body>')
-$append.Invoke("  <h1>GitHub Repositories</h1>")
-$append.Invoke("  <p>Generated: $(Get-Date -Format 'u')</p>")
+try { Generate-HTML -DataByAccount $allData -AccountOrder $AccountList } catch { Write-Host ("Failed to generate HTML: {0}" -f $_.Exception.Message) -ForegroundColor Red }
 
-if (@($allRepos).Count -eq 0) {
-    $append.Invoke('  <p>No repositories found for the provided accounts.</p>')
+# Final summary
+$hadAny = $false
+foreach ($k in $allData.Keys) {
+    if ((($allData[$k] | Measure-Object).Count) -gt 0) { $hadAny = $true; break }
+}
+
+if ($hadAny) {
+    Write-Host "Completed: repositories fetched and HTML generated." -ForegroundColor Green
 } else {
-    foreach ($repo in $allRepos | Sort-Object -Property Account,FullName) {
-        $append.Invoke('  <div class="repo">')
-        $append.Invoke("    <div class='title'><a href='$($repo.HtmlUrl)'>$($repo.FullName)</a></div>")
-
-        if ($repo.Description) {
-            $descText = [System.Web.HttpUtility]::HtmlEncode($repo.Description)
-            if (@($italicList).Count -gt 0 -and (@($italicList) -contains $repo.Name.ToLowerInvariant())) {
-                $append.Invoke("    <div class='meta'><em class='desc'>$descText</em></div>")
-            } else {
-                $append.Invoke("    <div class='meta'>$descText</div>")
-            }
-        }
-
-        if ($null -ne $repo.License) {
-            $licText = ''
-            if ($repo.License.spdx_id -and $repo.License.spdx_id -ne 'NOASSERTION') { $licText = $repo.License.spdx_id }
-            elseif ($repo.License.name) { $licText = $repo.License.name }
-            if ($licText -and $licText.Trim() -ne '') {
-                $append.Invoke("    <div class='meta'><strong>License:</strong> $([System.Web.HttpUtility]::HtmlEncode($licText))</div>")
-            } else {
-                $append.Invoke("    <div class='meta'><strong>License:</strong> (none)</div>")
-            }
-        }
-
-        if ($repo.Fork -and $null -ne $repo.Parent) {
-            $parentFull = $repo.Parent.full_name
-            $parentLicText = ''
-            if ($null -ne $repo.Parent.license) {
-                if ($repo.Parent.license.spdx_id -and $repo.Parent.license.spdx_id -ne 'NOASSERTION') { $parentLicText = $repo.Parent.license.spdx_id }
-                elseif ($repo.Parent.license.name) { $parentLicText = $repo.Parent.license.name }
-            }
-            if ($parentLicText -and $parentLicText.Trim() -ne '') {
-                $append.Invoke("    <div class='meta'><strong>Forked from:</strong> $([System.Web.HttpUtility]::HtmlEncode($parentFull)) ($([System.Web.HttpUtility]::HtmlEncode($parentLicText)))</div>")
-            } else {
-                $append.Invoke("    <div class='meta'><strong>Forked from:</strong> $([System.Web.HttpUtility]::HtmlEncode($parentFull))</div>")
-            }
-        }
-
-        if ($ShowStars) {
-            $starsVal = if ($repo.Stargazers -ne $null) { $repo.Stargazers } else { 0 }
-            $append.Invoke("    <div class='stat'><strong>$([System.Web.HttpUtility]::HtmlEncode($StarsLabel))</strong>$([System.Web.HttpUtility]::HtmlEncode($starsVal))</div>")
-        }
-
-        if ($ShowForks) {
-            $forksVal = if ($repo.ForksCount -ne $null) { $repo.ForksCount } else { 0 }
-            $append.Invoke("    <div class='stat'><strong>$([System.Web.HttpUtility]::HtmlEncode($ForksLabel))</strong>$([System.Web.HttpUtility]::HtmlEncode($forksVal))</div>")
-        }
-
-        $append.Invoke('  </div>')
-    }
+    Write-Host "Completed: no repositories found or API calls failed (see messages above)." -ForegroundColor Yellow
 }
 
-$append.Invoke('</body>')
-$append.Invoke('</html>')
-
-try {
-    $sb.ToString() | Out-File -FilePath $outputHtml -Encoding UTF8
-    Write-Host "Generated: $outputHtml"
-    exit 0
-} catch {
-    Write-DiagnosticError "Failed to write output HTML: $($_.Exception.Message)"
-    exit 3
-}
+exit 0
