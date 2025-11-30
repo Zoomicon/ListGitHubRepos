@@ -33,11 +33,43 @@ if defined GITHUB_TOKEN (
 )
 echo.
 
+rem Optional: uncomment to set max attempts explicitly (default is 4 in the script)
+:: set MAX_ATTEMPTS=4
+
+rem Optional flags (uncomment to enable)
+:: set HIDE_FORKS=1
+:: set SKIP_DOT=1
+:: set SAVE_DEBUG=1
+
+rem Export GITHUB_TOKEN into the environment for the PowerShell process if provided
+if defined GITHUB_TOKEN (
+  set "GITHUB_TOKEN=%GITHUB_TOKEN%"
+)
+
+rem --- build extra args safely ---
+set "EXTRA_ARGS="
+
+if defined MAX_ATTEMPTS (
+  set "EXTRA_ARGS=%EXTRA_ARGS% -MaxAttempts %MAX_ATTEMPTS%"
+)
+
+if defined HIDE_FORKS (
+  set "EXTRA_ARGS=%EXTRA_ARGS% -HideForks"
+)
+
+if defined SKIP_DOT (
+  set "EXTRA_ARGS=%EXTRA_ARGS% -SkipDotPrefix"
+)
+
+if defined SAVE_DEBUG (
+  set "EXTRA_ARGS=%EXTRA_ARGS% -SaveDebugFiles"
+)
+
 rem --- run the PowerShell script from this batch's folder ---
 pushd "%~dp0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0%SCRIPT%" -Accounts "%ACCOUNTS%"
-:: -HideForks -SkipDotPrefix -SaveDebugFiles
 
+rem Call PowerShell with -File and pass -Accounts as a separate, quoted argument.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0%SCRIPT%" -Accounts "%ACCOUNTS%" %EXTRA_ARGS%
 set "PS_EXIT=%ERRORLEVEL%"
 
 rem --- open output only if PowerShell succeeded and file exists ---
