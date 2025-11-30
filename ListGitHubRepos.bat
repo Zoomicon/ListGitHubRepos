@@ -1,90 +1,89 @@
 @echo off
-rem RunListGitHub_OpenOnSuccess.bat
-rem Usage: RunListGitHub_OpenOnSuccess.bat [accounts]
-rem Falls back to ListGitHubRepos_Accounts env var or prompts if needed.
+REM ListGitHubRepos.bat
+REM Constants are defined here; edit them instead of using environment variables.
 setlocal
 
-set "SCRIPT=ListGitHubRepos.ps1"
-set "OUTPUT=GitHubRepos.html"
+set "SCRIPT=%~dp0ListGitHubRepos.ps1"
 
-rem --- determine accounts ---
+REM --- Configuration constants (edit these) ---
+set "GITHUB_TOKEN="        REM <-- put your token here, keep this file private
+set "HIDE_FORKS=0"
+set "SKIP_DOT=0"
+set "SAVE_DEBUG=1"         REM enable saving debug responses
+set "MAX_ATTEMPTS=4"
+set "EXCLUDE_NAMES=.github"
+set "SHOW_STARS=0"
+set "SHOW_FORKS=0"
+set "STARS_LABEL=Stars:"
+set "FORKS_LABEL=Forks:"
+set "ITALIC_NAMES=.github"
+
+if "%~1"=="/?" goto help
+if "%~1"=="-h" goto help
+
+goto collect_args
+
+:collect_args
+REM Prompt for accounts (quoted form preserves ":" and trailing space)
 if "%~1"=="" (
-  if defined ListGitHubRepos_Accounts (
-    set "ACCOUNTS=%ListGitHubRepos_Accounts%"
-  ) else (
     set /p "ACCOUNTS=Enter GitHub accounts (comma or space separated): "
-  )
 ) else (
-  set "ACCOUNTS=%~1"
+    set "ACCOUNTS=%*"
 )
 
-if "%ACCOUNTS%"=="" (
-  echo No accounts provided. Exiting.
-  pause
-  endlocal
-  exit /b 1
+REM Export token and debug dir as environment variables for PowerShell
+if not "%GITHUB_TOKEN%"=="" set "GITHUB_TOKEN=%GITHUB_TOKEN%"
+set "DEBUG_DIR=%~dp0repo-debug"
+
+REM Build PowerShell argument string (use CALL SET to avoid parser issues)
+set "PSARGS=-NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Accounts "%ACCOUNTS%""
+
+if "%HIDE_FORKS%"=="1" call set "PSARGS=%%PSARGS%% -HideForks"
+if "%SKIP_DOT%"=="1" call set "PSARGS=%%PSARGS%% -SkipDotPrefix"
+if "%SAVE_DEBUG%"=="1" call set "PSARGS=%%PSARGS%% -SaveDebugFiles"
+
+if not "%MAX_ATTEMPTS%"=="" call set "PSARGS=%%PSARGS%% -MaxAttempts %MAX_ATTEMPTS%"
+
+if not "%EXCLUDE_NAMES%"=="" (
+    call set "PSARGS=%%PSARGS%% -ExcludeNames "%EXCLUDE_NAMES%""
 )
 
-echo Accounts = %ACCOUNTS%
-if defined GITHUB_TOKEN (
-  echo GITHUB_TOKEN is set (using authenticated requests)
-) else (
-  echo No GITHUB_TOKEN set (unauthenticated requests)
+if "%SHOW_STARS%"=="1" call set "PSARGS=%%PSARGS%% -ShowStars"
+if "%SHOW_FORKS%"=="1" call set "PSARGS=%%PSARGS%% -ShowForks"
+
+if not "%STARS_LABEL%"=="" (
+    call set "PSARGS=%%PSARGS%% -StarsLabel "%STARS_LABEL%""
 )
+
+if not "%FORKS_LABEL%"=="" (
+    call set "PSARGS=%%PSARGS%% -ForksLabel "%FORKS_LABEL%""
+)
+
+if not "%ITALIC_NAMES%"=="" (
+    call set "PSARGS=%%PSARGS%% -ItalicNames "%ITALIC_NAMES%""
+)
+
+echo.
+echo Running PowerShell:
+echo powershell.exe %PSARGS%
 echo.
 
-rem Optional: uncomment to set max attempts explicitly (default is 4 in the script)
-:: set MAX_ATTEMPTS=4
+powershell.exe %PSARGS%
+set "EXITCODE=%ERRORLEVEL%"
 
-rem Optional flags (uncomment to enable)
-:: set HIDE_FORKS=1
-:: set SKIP_DOT=1
-:: set SAVE_DEBUG=1
-
-rem Export GITHUB_TOKEN into the environment for the PowerShell process if provided
-if defined GITHUB_TOKEN (
-  set "GITHUB_TOKEN=%GITHUB_TOKEN%"
-)
-
-rem --- build extra args safely ---
-set "EXTRA_ARGS="
-
-if defined MAX_ATTEMPTS (
-  set "EXTRA_ARGS=%EXTRA_ARGS% -MaxAttempts %MAX_ATTEMPTS%"
-)
-
-if defined HIDE_FORKS (
-  set "EXTRA_ARGS=%EXTRA_ARGS% -HideForks"
-)
-
-if defined SKIP_DOT (
-  set "EXTRA_ARGS=%EXTRA_ARGS% -SkipDotPrefix"
-)
-
-if defined SAVE_DEBUG (
-  set "EXTRA_ARGS=%EXTRA_ARGS% -SaveDebugFiles"
-)
-
-rem --- run the PowerShell script from this batch's folder ---
-pushd "%~dp0"
-
-rem Call PowerShell with -File and pass -Accounts as a separate, quoted argument.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0%SCRIPT%" -Accounts "%ACCOUNTS%" %EXTRA_ARGS%
-set "PS_EXIT=%ERRORLEVEL%"
-
-rem --- open output only if PowerShell succeeded and file exists ---
-if "%PS_EXIT%"=="0" (
-  if exist "%~dp0%OUTPUT%" (
-    echo PowerShell completed successfully. Opening %OUTPUT%...
-    start "" "%~dp0%OUTPUT%"
-  ) else (
-    echo PowerShell completed with exit code 0 but %OUTPUT% was not found.
-  )
+if "%EXITCODE%"=="0" (
+    if exist "%~dp0GitHubRepos.html" (
+        start "" "%~dp0GitHubRepos.html"
+    )
 ) else (
-  echo PowerShell failed with exit code %PS_EXIT%. Not opening %OUTPUT%.
+    echo PowerShell failed with exit code %EXITCODE%.
 )
 
-popd
 endlocal
+exit /b %EXITCODE%
+
+:help
+echo Usage: ListGitHubRepos.bat [accounts]
 echo.
-pause
+echo Edit the constants at the top of this file to change behavior; do not rely on environment variables.
+exit /b 0
